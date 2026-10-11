@@ -5,7 +5,7 @@
 When a sensor spikes, EcoTwin checks the live data in Tiger Data, looks at a camera frame of the site with Gemini, remembers whether this location has a history of problems, broadcasts a spoken warning with ElevenLabs, and tracks the incident until the readings are safe again. Then it pays the response crew a small bounty on Solana.
 
 > **Live demo:** _add your hosted URL here_
-> **Demo video:** _https://youtu.be/L9hkzqzNn2Q?si=WcTUKG3sFAXhYcYi_
+> **Demo video:** _optional, add link here_
 
 ---
 
@@ -68,7 +68,7 @@ When a hazardous incident resolves, the response crew earns a bounty scaled by s
 Safeguards: devnet only (the code refuses mainnet URLs and checks the network before signing), throwaway keys stored locally and gitignored, and an automatic fallback to mock if devnet is unavailable.
 
 ### Interfaces
-- **Dashboard** (`/`): live chart against the safety limit, status badge, Gemini's verdict with the camera frame, pattern and status badges, alert timing, bounty, history, and the voice broadcast.
+- **Dashboard** (`/`): a **Trigger contamination spike** button (anyone can run the demo), a resolution countdown, live chart against the safety limit, status badge, Gemini's verdict with the camera frame, pattern and status badges, alert timing, bounty, history, and the voice broadcast.
 - **Voice console** (top of the dashboard): speak (Chrome/Safari) or type a question. Gemini answers only from a read-only snapshot of live Tiger Data, and ElevenLabs speaks the reply. Follow-up questions keep context.
 - **Crew wallet** (`/wallet`): a phone-style screen for the response crew that shows each bounty arriving. It is clearly labelled as simulated and only displays database records.
 
@@ -85,6 +85,8 @@ Safeguards: devnet only (the code refuses mainnet URLs and checks the network be
 ## Project structure
 
 ```
+run_all.py           One command / one process: dashboard + engine + headless simulator (used for hosting)
+render.yaml          Render deployment blueprint
 ecotwin_core.py      Detection loop, Gemini + ElevenLabs, incident lifecycle, resolution, bounties
 simulate.py          Live sensor simulator (keyboard-controlled contamination spike)
 dashboard.py         FastAPI dashboard, crew wallet page, voice console endpoints
@@ -159,7 +161,14 @@ SELECT setval('sensor_nodes_node_id_seq', (SELECT max(node_id) FROM sensor_nodes
 ```
 EcoTwin adds the remaining columns and tables (incident status, `bounty_payouts`, `agent_memory`) automatically on startup.
 
-### 4. Run (three terminals)
+### 4. Run
+
+**Simplest: everything in one process**
+```bash
+python3 run_all.py      # http://127.0.0.1:8000, then press "Trigger contamination spike"
+```
+
+**Or in three terminals** (keyboard control of the simulator)
 ```bash
 python3 simulate.py --reset --spike-after 20   # sensor stream; keys: s = spike, n = normal, q = quit
 python3 ecotwin_core.py                        # detection + AI + alerts + resolution
@@ -178,11 +187,19 @@ python3 solana_setup.py          # creates throwaway devnet wallets, verifies de
 # set SOLANA_MODE=devnet in .env and restart ecotwin_core.py
 ```
 
+## Deploying (Render + custom domain)
+1. Push this repo to GitHub (secrets stay out via `.gitignore`).
+2. On [Render](https://render.com): **New → Blueprint** and pick the repo (uses `render.yaml`), or **New → Web Service** with build command `pip install -r requirements.txt` and start command `python run_all.py`.
+3. Enter the secret environment variables Render asks for: `TIGER_DATABASE_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, and optionally `DEMO_PASSCODE`.
+4. Custom domain: in Render, **Settings → Custom Domains → Add** (e.g. `ecotwin.yourdomain.com`), then add the `CNAME` record Render shows at your DNS provider and click **Verify**. HTTPS is issued automatically.
+
+**Public-demo safeguards:** one event at a time, a cooldown between spikes, daily caps on incidents and voice questions, per-visitor rate limiting, an optional passcode, and the voice endpoint only speaks answers EcoTwin generated. All limits are configurable (see `.env.example`). The Render free plan sleeps when idle, which pauses the simulator; the Starter plan stays on.
+
 ## Demo walkthrough
 1. Normal readings stream in around 13 NTU, well under the 15 NTU limit.
-2. A contamination spike starts. Within seconds EcoTwin detects it, Gemini analyzes the readings plus the outfall photo, and a spoken warning plays. The dashboard shows the verdict, the grounded action plan and the alert timing.
+2. Press **Trigger contamination spike** (or `s` in the simulator). A contamination spike starts. Within seconds EcoTwin detects it, Gemini analyzes the readings plus the outfall photo, and a spoken warning plays. The dashboard shows the verdict, the grounded action plan and the alert timing.
 3. Ask the voice console: *"What's the status of the downtown basin, and do we have field crews nearby?"*
-4. The spike ends, readings stay safe for the resolution window, the incident flips to **RESOLVED**, and the crew wallet receives its bounty.
+4. The spike ends and a countdown shows the readings staying safe for the resolution window; the incident flips to **RESOLVED** and the crew wallet receives its bounty.
 5. Repeat: by the third event at this node, EcoTwin flags it as a **SYSTEMIC PATTERN** and the action plan targets the recurring source.
 
 ## Design decisions and honest limits

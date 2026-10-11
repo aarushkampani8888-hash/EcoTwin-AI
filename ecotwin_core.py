@@ -176,6 +176,12 @@ CREATE TABLE IF NOT EXISTS bounty_payouts (
 ALTER TABLE bounty_payouts
     ADD COLUMN IF NOT EXISTS status TEXT,
     ADD COLUMN IF NOT EXISTS explorer_url TEXT;
+CREATE TABLE IF NOT EXISTS demo_controls (
+    node_id      INT PRIMARY KEY,
+    spike_until  TIMESTAMPTZ,
+    requested_at TIMESTAMPTZ,
+    requested_by TEXT
+);
 """
 
 

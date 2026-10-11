@@ -1,0 +1,35 @@
+# Render Blueprint: one web service runs the dashboard, detection engine and simulator.
+# Secrets are marked sync: false, so Render asks for them in its dashboard (never stored in git).
+services:
+  - type: web
+    name: ecotwin-ai
+    runtime: python
+    plan: starter            # always on; the free plan sleeps after 15 min idle and pauses the simulator
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run_all.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: TIGER_DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: DEMO_PASSCODE
+        sync: false
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_flash_v2_5
+      - key: AUTOPLAY
+        value: "false"
+      - key: POLL_SECONDS
+        value: "2"
+      - key: RESOLUTION_WINDOW
+        value: 1 minute
+      - key: SOLANA_MODE
+        value: mock
+      - key: AUTO_SPIKE_MINUTES
+        value: "0"

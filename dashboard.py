@@ -16,15 +16,19 @@ The dashboard only reads data. Detection still runs in ecotwin_core.py.
 
 from __future__ import annotations
 
+import hmac
 import os
 import threading
+import time
+import uuid
+from collections import OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 import psycopg
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
@@ -35,6 +39,7 @@ from ecotwin_core import (
     DATABASE_URL,
     FRAMES_DIR,
     SCHEMA_UPGRADE_SQL,
+    RESOLUTION_WINDOW,
     SENSOR_PROFILES,
     synthesize_broadcast,
 )
@@ -43,6 +48,17 @@ import voice_console  # noqa: E402
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 DEFAULT_NODE = int(os.getenv("DASHBOARD_NODE", "402"))
+
+# Public-site protection. Every spike costs a Gemini call + a voice render, and
+# every console question costs another pair, so both are capped.
+DEMO_PASSCODE = os.getenv("DEMO_PASSCODE", "").strip()      # optional; empty = open to everyone
+SPIKE_SECONDS = float(os.getenv("SPIKE_SECONDS", "45"))       # how long a triggered spike lasts
+SPIKE_COOLDOWN_S = int(os.getenv("SPIKE_COOLDOWN_SECONDS", "180"))
+DAILY_INCIDENT_LIMIT = int(os.getenv("DAILY_INCIDENT_LIMIT", "30"))
+ASK_DAILY_LIMIT = int(os.getenv("ASK_DAILY_LIMIT", "40"))
+ASK_MIN_INTERVAL_S = float(os.getenv("ASK_MIN_INTERVAL_SECONDS", "8"))
+
+WORKERS: dict[str, threading.Thread] = {}  # filled in by run_all.py
 CHART_MINUTES = int(os.getenv("DASHBOARD_MINUTES", "15"))
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_CHART_JS = BASE_DIR / "static" / "chart.umd.min.js"
@@ -90,6 +106,21 @@ def iso(value):
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"ok": True, "workers": {name: t.is_alive() for name, t in WORKERS.items()}}
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
+
+
+def require_passcode(request: Request) -> None:
+    if DEMO_PASSCODE and not hmac.compare_digest(request.headers.get("x-demo-passcode", ""), DEMO_PASSCODE):
+        raise HTTPException(401, "Demo passcode required")
+
+
 @app.get("/api/nodes")
 def nodes() -> list[dict]:
     return query("SELECT node_id, zone_name, sensor_type FROM sensor_nodes ORDER BY node_id")
@@ -134,7 +165,35 @@ def state(node_id: int = Query(DEFAULT_NODE), minutes: int = Query(CHART_MINUTES
 
     latest = readings[-1]["metric_value"] if readings else None
     limit = profile["max"]
+
+    demo_rows = query(
+        """
+        SELECT spike_until > now() AS spike_active,
+               GREATEST(0, extract(epoch FROM spike_until - now())) AS spike_left,
+               GREATEST(0, extract(epoch FROM requested_at + make_interval(secs => %s) - now())) AS cooldown_left
+        FROM demo_controls WHERE node_id = %s
+        """,
+        (SPIKE_COOLDOWN_S, node_id),
+    )
+    d = demo_rows[0] if demo_rows else {}
+    resolution = None
+    if incidents and incidents[0]["status"] == "OPEN" and limit is not None:
+        r = query(
+            """
+            SELECT extract(epoch FROM now() - COALESCE(
+                       (SELECT max(time) FROM sensor_readings WHERE node_id = %s AND metric_value > %s), now()))
+                       AS safe_s,
+                   extract(epoch FROM %s::interval) AS window_s
+            """,
+            (node_id, limit, RESOLUTION_WINDOW),
+        )[0]
+        resolution = {"safe_s": round(float(r["safe_s"])), "window_s": round(float(r["window_s"]))}
     return {
+        "demo": {"spike_active": bool(d.get("spike_active")),
+                 "spike_left": round(float(d.get("spike_left") or 0)),
+                 "cooldown_left": round(float(d.get("cooldown_left") or 0)),
+                 "passcode_required": bool(DEMO_PASSCODE)},
+        "resolution": resolution,
         "server_time": datetime.now().astimezone().isoformat(),
         "node": {**node, "latitude": float(node["latitude"]), "longitude": float(node["longitude"])},
         "metric": {"label": profile["label"], "unit": profile["unit"], "limit": limit},
@@ -198,32 +257,84 @@ def wallet_state() -> dict:
 # ---------------------------------------------------------------------------
 # Voice command console
 # ---------------------------------------------------------------------------
+@app.post("/api/demo/spike")
+def trigger_spike(request: Request, node_id: int = Query(DEFAULT_NODE)) -> dict:
+    """The 'Trigger contamination spike' button. One event at a time, with a cooldown and a daily cap."""
+    require_passcode(request)
+    d = query("SELECT spike_until > now() AS active, "
+              "GREATEST(0, extract(epoch FROM requested_at + make_interval(secs => %s) - now())) AS cooldown "
+              "FROM demo_controls WHERE node_id = %s", (SPIKE_COOLDOWN_S, node_id))
+    if d and d[0]["active"]:
+        raise HTTPException(409, "A spike is already running")
+    if query("SELECT 1 FROM environmental_incidents WHERE node_id = %s AND status = 'OPEN' LIMIT 1", (node_id,)):
+        raise HTTPException(409, "An incident is still open. Wait for it to auto-resolve first")
+    if d and float(d[0]["cooldown"] or 0) > 0:
+        raise HTTPException(429, f"Next spike available in {round(float(d[0]['cooldown']))}s")
+    today = query("SELECT count(*) AS n FROM environmental_incidents WHERE detected_at > now() - interval '1 day'")
+    if today and today[0]["n"] >= DAILY_INCIDENT_LIMIT:
+        raise HTTPException(429, "Daily demo limit reached. Please try again tomorrow")
+    query(
+        """
+        INSERT INTO demo_controls (node_id, spike_until, requested_at, requested_by)
+        VALUES (%s, now() + make_interval(secs => %s), now(), %s)
+        ON CONFLICT (node_id) DO UPDATE SET spike_until = EXCLUDED.spike_until,
+            requested_at = EXCLUDED.requested_at, requested_by = EXCLUDED.requested_by
+        """,
+        (node_id, SPIKE_SECONDS, "dashboard:" + client_ip(request)),
+    )
+    return {"ok": True, "spike_seconds": SPIKE_SECONDS}
+
+
+# ---------------------------------------------------------------------------
+# Voice command console
+# ---------------------------------------------------------------------------
 class AskBody(BaseModel):
     question: str = Field(..., max_length=400)
     history: list[dict] = Field(default_factory=list, max_length=6)
 
 
 class SpeakBody(BaseModel):
-    text: str = Field(..., max_length=600)
+    answer_id: str = Field(..., max_length=64)
 
 
 # One question at a time: every answer costs a Gemini call and a voice render.
 _ask_lock = threading.Lock()
 _speak_lock = threading.Lock()
+_last_ask: dict[str, float] = defaultdict(float)
+_asks_today: deque = deque()                     # timestamps of answered questions, last 24h
+# Only answers EcoTwin generated can be spoken, so the voice endpoint can't be
+# used as a free text-to-speech service for arbitrary text.
+_answers: OrderedDict[str, dict] = OrderedDict()
 
 
 @app.post("/api/ask")
-def ask(body: AskBody) -> dict:
+def ask(body: AskBody, request: Request) -> dict:
+    require_passcode(request)
     question = body.question.strip()
     if not question:
         raise HTTPException(400, "Empty question")
+    ip, now = client_ip(request), time.time()
+    if now - _last_ask[ip] < ASK_MIN_INTERVAL_S:
+        raise HTTPException(429, f"One question every {ASK_MIN_INTERVAL_S:g} seconds, please")
+    while _asks_today and now - _asks_today[0] > 86400:
+        _asks_today.popleft()
+    if len(_asks_today) >= ASK_DAILY_LIMIT:
+        raise HTTPException(429, "The voice console has reached today's limit")
     if not _ask_lock.acquire(blocking=False):
         raise HTTPException(429, "Still answering the previous question")
     try:
+        _last_ask[ip] = now
         snapshot = voice_console.build_snapshot(query)
-        result = voice_console.answer(question, snapshot, body.history)
-        return {"question": question, "answer": result.get("answer", ""),
+        result = voice_console.answer(question, snapshot, body.history[-3:])
+        _asks_today.append(now)
+        answer_id = uuid.uuid4().hex
+        _answers[answer_id] = {"text": (result.get("answer") or "")[:600], "audio": None}
+        while len(_answers) > 50:
+            _answers.popitem(last=False)
+        return {"question": question, "answer": result.get("answer", ""), "answer_id": answer_id,
                 "node_ids": result.get("node_ids", []), "gemini_s": result.get("gemini_s")}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"EcoTwin couldn't answer: {exc}") from exc
     finally:
@@ -231,16 +342,20 @@ def ask(body: AskBody) -> dict:
 
 
 @app.post("/api/speak")
-def speak(body: SpeakBody) -> dict:
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "Nothing to say")
+def speak(body: SpeakBody, request: Request) -> dict:
+    require_passcode(request)
+    entry = _answers.get(body.answer_id)
+    if not entry or not entry["text"].strip():
+        raise HTTPException(404, "Unknown answer")
+    if entry["audio"]:
+        return {"audio": entry["audio"]}  # already rendered: never pay twice
     if not _speak_lock.acquire(blocking=False):
         raise HTTPException(429, "Already speaking")
     try:
         folder = AUDIO_DIR if AUDIO_DIR.is_absolute() else BASE_DIR / AUDIO_DIR
-        path = synthesize_broadcast(text, folder / f"console_{int(datetime.now().timestamp() * 1000)}.mp3")
-        return {"audio": f"/audio/{path.name}"}
+        path = synthesize_broadcast(entry["text"], folder / f"console_{int(datetime.now().timestamp() * 1000)}.mp3")
+        entry["audio"] = f"/audio/{path.name}"
+        return {"audio": entry["audio"]}
     except Exception as exc:
         raise HTTPException(502, f"Voice unavailable: {exc}") from exc
     finally:
@@ -324,6 +439,12 @@ PAGE = r"""<!doctype html>
   .history { margin-top: 16px; }
   .history li { color: var(--muted); font-size: 13px; margin: 4px 0; }
   ul { padding-left: 18px; margin: 0; }
+  .demo-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .primary { background: var(--crit); color: #fff; border-color: var(--crit); font-weight: 600; padding: 9px 14px; }
+  .primary:disabled { background: var(--bg); color: var(--muted); border-color: var(--line); cursor: default; }
+  .demo-state { color: var(--muted); font-size: 13px; flex: 1; min-width: 200px; }
+  .progress { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 6px; }
+  .progress > div { height: 100%; background: var(--ok); width: 0; transition: width .5s; }
   .console { display: flex; gap: 12px; align-items: flex-start; padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
   @media (max-width: 900px) { .console { padding: 12px 16px; } }
   .mic { width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font-size: 20px; cursor: pointer; flex: none; display: grid; place-items: center; }
@@ -387,6 +508,11 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <div class="row">Resources on file: <span class="tags" id="resources"></span></div>
+    <div class="demo-row">
+      <button id="spikebtn" class="primary" type="button">⚡ Trigger contamination spike</button>
+      <div class="demo-state"><span id="demostate">Simulated sensor · press to start a contamination event at the outfall</span>
+        <div class="progress" id="progress" hidden><div id="progressbar"></div></div></div>
+    </div>
   </section>
 
   <section class="panel" id="incident-panel">
@@ -552,6 +678,7 @@ async function refresh() {
     }
 
     renderIncident(latestInc);
+    renderDemo(s);
     renderHistory(s.incidents);
 
     // Play each incident's broadcast exactly once, as soon as its audio exists.
@@ -588,6 +715,47 @@ $("autoplay").addEventListener("click", () => {
   }
 });
 
+// ---- Calls that cost credits (optional demo passcode) -----------------------
+async function api(path, body) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let pass = ""; try { pass = localStorage.getItem("ecotwin-pass") || ""; } catch (e) {}
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Demo-Passcode": pass },
+                                  body: JSON.stringify(body || {}) });
+    if (r.status === 401 && attempt === 0) {
+      const p = window.prompt("This demo needs a passcode (see the project submission):");
+      if (!p) throw new Error("Passcode required");
+      try { localStorage.setItem("ecotwin-pass", p.trim()); } catch (e) {}
+      continue;
+    }
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || r.statusText);
+    return data;
+  }
+}
+
+function renderDemo(s) {
+  const d = s.demo || {}, res = s.resolution, btn = $("spikebtn"), latest = s.incidents[0];
+  let text, ready = false, pct = null;
+  if (d.spike_active) text = `Contamination spike running · ${d.spike_left}s left · watch EcoTwin detect it`;
+  else if (latest && latest.status === "OPEN" && res) {
+    if (res.safe_s < 2) text = "Incident open · waiting for readings to return to safe levels";
+    else { pct = Math.min(100, Math.round(100 * res.safe_s / res.window_s));
+           text = `Readings safe for ${Math.min(res.safe_s, res.window_s)}s of ${res.window_s}s · auto-resolving…`; }
+  }
+  else if (d.cooldown_left > 0) text = `Next spike available in ${d.cooldown_left}s`;
+  else { ready = true; text = "Simulated sensor · press to start a contamination event at the outfall"; }
+  btn.disabled = !ready;
+  $("demostate").textContent = text;
+  $("progress").hidden = pct === null;
+  if (pct !== null) $("progressbar").style.width = pct + "%";
+}
+
+$("spikebtn").addEventListener("click", async () => {
+  $("spikebtn").disabled = true;
+  try { await api("/api/demo/spike"); $("demostate").textContent = "Spike starting…"; }
+  catch (err) { $("demostate").textContent = err.message; }
+});
+
 // ---- Voice command console ----------------------------------------------
 const convo = [];
 let asking = false, recognizer = null;
@@ -603,16 +771,10 @@ async function askEcoTwin(question) {
   asking = true; $("askinput").value = "";
   setReply(question, "", "Checking live data…");
   try {
-    const r = await fetch("/api/ask", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, history: convo.slice(-3) }) });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.detail || r.statusText);
+    const data = await api("/api/ask", { question, history: convo.slice(-3) });
     convo.push({ q: question, a: data.answer });
     setReply(question, data.answer, `Answered from live Tiger Data in ${data.gemini_s}s · generating voice…`);
-    const v = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: data.answer }) });
-    const vd = await v.json();
-    if (!v.ok) throw new Error(vd.detail || "voice failed");
+    const vd = await api("/api/speak", { answer_id: data.answer_id });
     $("voice").src = vd.audio;
     await $("voice").play().catch(() => {});
     setReply(question, data.answer, `Answered from live Tiger Data in ${data.gemini_s}s`);
