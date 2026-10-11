@@ -1,1 +1,0 @@
-# EcoTwin-AI
