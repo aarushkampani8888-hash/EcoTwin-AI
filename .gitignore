@@ -1,0 +1,11 @@
+.env
+__pycache__/
+audio/
+.env.bak
+.ecotwin_core.lock
+.backboard_assistant_id
+.solana_treasury.json
+.solana_crew.json
+frames/original/
+.DS_Store
+console_*.mp3
