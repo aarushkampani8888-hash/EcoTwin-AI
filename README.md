@@ -5,7 +5,7 @@
 When a sensor spikes, EcoTwin checks the live data in Tiger Data, looks at a camera frame of the site with Gemini, remembers whether this location has a history of problems, broadcasts a spoken warning with ElevenLabs, and tracks the incident until the readings are safe again. Then it pays the response crew a small bounty on Solana.
 
 > **Live demo:** _add your hosted URL here_
-> **Demo video:** _optional, add link here_
+> **Demo video:** _https://youtu.be/L9hkzqzNn2Q?si=WcTUKG3sFAXhYcYi_
 
 ---
 
