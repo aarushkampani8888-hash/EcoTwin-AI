@@ -865,6 +865,10 @@ WALLET_PAGE = r"""<!doctype html>
   .st { font-size: 11px; font-weight: 700; text-align: right; }
   .st.ok { color: var(--ok); } .st.pending { color: var(--warn); } .st.bad { color: var(--bad); } .st.mockst { color: var(--muted); }
   li a { color: var(--accent); font-size: 12px; grid-column: 1 / -1; text-decoration: none; }
+  .acthead { display: flex; justify-content: space-between; align-items: center; }
+  .acthead .actions { display: flex; gap: 12px; }
+  .link { background: none; border: none; color: var(--accent); font: inherit; font-size: 12px; text-transform: none; letter-spacing: 0; cursor: pointer; padding: 0; }
+  li.old { opacity: .55; }
   .empty { color: var(--muted); text-align: center; padding: 30px 20px; }
   .toast { position: fixed; left: 50%; top: 18px; transform: translate(-50%, -140%); width: min(360px, calc(100% - 24px));
     background: #f4faf7; color: #0e1a16; border-radius: 18px; padding: 12px 14px; display: flex; gap: 12px; align-items: center;
@@ -885,12 +889,12 @@ WALLET_PAGE = r"""<!doctype html>
     <span class="net" id="net">MOCK</span>
   </header>
   <section class="balance">
-    <div class="lbl">Bounties earned</div>
+    <div class="lbl">Earned this session</div>
     <div class="amt" id="total">0.00 SOL</div>
     <div class="sub" id="count">No payouts yet</div>
   </section>
   <button class="sound" id="sound" type="button">Tap to turn on payment sounds</button>
-  <h2>Activity</h2>
+  <h2 class="acthead"><span>Activity</span><span class="actions"><button id="older" type="button" class="link" hidden></button><button id="clear" type="button" class="link">Clear</button></span></h2>
   <ul id="list"><li class="empty" style="display:block">Bounties appear here when EcoTwin resolves an incident.</li></ul>
 </div>
 <script>
@@ -901,6 +905,9 @@ const when = t => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "
 const STATUS = {submitted: ["Confirming…", "pending"], processed: ["Confirming…", "pending"], confirmed: ["Confirmed", "ok"],
                 finalized: ["Finalized", "ok"], failed: ["Failed", "bad"], expired: ["Not confirmed", "bad"], mock: ["Simulated", "mockst"]};
 let seen = null, audio = null, toastTimer = null;
+// The wallet starts fresh on every visit: only payouts newer than this baseline
+// count toward the balance and appear in Activity. Earlier ones stay one click away.
+let baseline = null, showOlder = false, lastData = null;
 
 function chime() {
   if (!audio) return;
@@ -927,15 +934,25 @@ function notify(p) {
 async function refresh() {
   try {
     const w = await (await fetch("/api/wallet", {cache: "no-store"})).json();
-    $("total").textContent = w.total_sol.toFixed(2) + " SOL";
-    $("count").textContent = w.count ? `${w.count} bount${w.count === 1 ? "y" : "ies"} received` : "No payouts yet";
+    lastData = w;
+    const maxId = w.payouts.reduce((m, p) => Math.max(m, p.payout_id), 0);
+    if (baseline === null) baseline = maxId;
+    const session = w.payouts.filter(p => p.payout_id > baseline);
+    const older = w.payouts.filter(p => p.payout_id <= baseline);
+    const counted = session.filter(p => p.status !== "failed" && p.status !== "expired");
+    const total = counted.reduce((t, p) => t + p.amount_sol, 0);
+    $("total").textContent = total.toFixed(2) + " SOL";
+    $("count").textContent = counted.length ? `${counted.length} bount${counted.length === 1 ? "y" : "ies"} received` : "Waiting for the first bounty";
     if (w.address) $("addr").textContent = short(w.address);
     const devnet = w.payouts.length && w.payouts[0].network === "devnet";
     $("net").textContent = devnet ? "DEVNET" : "MOCK";
-    const fresh = seen === null ? [] : w.payouts.filter(p => !seen.has(p.payout_id));
-    $("list").innerHTML = w.payouts.length ? w.payouts.map(p => {
+    $("older").hidden = older.length === 0;
+    $("older").textContent = showOlder ? "Hide earlier" : `Show earlier (${older.length})`;
+    const fresh = seen === null ? [] : session.filter(p => !seen.has(p.payout_id));
+    const shown = showOlder ? session.concat(older) : session;
+    $("list").innerHTML = shown.length ? shown.map(p => {
       const [label, cls] = STATUS[p.status] || [p.status || "", "mockst"];
-      return `<li class="${fresh.includes(p) ? "new" : ""}">
+      return `<li class="${fresh.includes(p) ? "new" : ""}${p.payout_id <= baseline ? " old" : ""}">
         <span class="t">Incident #${p.incident_id} resolved</span><span class="a">+${p.amount_sol} SOL</span>
         <span class="m">${esc(p.zone_name || "")}${p.severity_level ? " · " + esc(p.severity_level) : ""} · ${when(p.created_at)}</span>
         <span class="st ${cls}">${label}</span>
@@ -946,6 +963,12 @@ async function refresh() {
     seen = new Set(w.payouts.map(p => p.payout_id));
   } catch (e) { /* keep last view; retry next tick */ }
 }
+
+$("older").addEventListener("click", () => { showOlder = !showOlder; refresh(); });
+$("clear").addEventListener("click", () => {
+  if (lastData) baseline = lastData.payouts.reduce((m, p) => Math.max(m, p.payout_id), baseline || 0);
+  showOlder = false; refresh();
+});
 
 $("sound").addEventListener("click", () => {
   try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch (e) {}
