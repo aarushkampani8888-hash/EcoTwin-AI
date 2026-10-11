@@ -4,8 +4,11 @@
 
 When a sensor spikes, EcoTwin checks the live data in Tiger Data, looks at a camera frame of the site with Gemini, remembers whether this location has a history of problems, broadcasts a spoken warning with ElevenLabs, and tracks the incident until the readings are safe again. Then it pays the response crew a small bounty on Solana.
 
-> **Live demo:** _add your hosted URL here_
-> **Demo video:** _optional, add link here_
+> **Live demo:** https://ecotwin-ai-stdf.onrender.com  (crew wallet: [/wallet](https://ecotwin-ai-stdf.onrender.com/wallet))
+>
+> **Demo passcode:** `ecotwin-demo-2026` (asked once when you press **Trigger contamination spike** or use the voice console)
+>
+> **Note:** the demo runs on a free instance, so the first visit after a quiet period can take about a minute to wake up.
 
 ---
 
