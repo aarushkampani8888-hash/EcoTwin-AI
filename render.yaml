@@ -4,7 +4,7 @@ services:
   - type: web
     name: ecotwin-ai
     runtime: python
-    plan: 0.5c-512mb         # smallest always-on instance; "free" sleeps after 15 min idle and pauses the simulator
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python run_all.py
     healthCheckPath: /healthz
